@@ -2,14 +2,14 @@
   "$schema": "https://raw.githubusercontent.com/coi-lang/registry/main/schema/package.schema.json",
   "name": "coi/pdf",
   "schema-version": 1,
-  "repository": "https://github.com/coi-lang/coi-pdf",
+  "repository": "https://github.com/coi/coi-pdf",
   "description": "Write PDF files from drawing commands: paths, pictures, and text in embedded TrueType fonts.",
   "keywords": ["pdf", "export", "fonts", "truetype"],
   "releases": [{
     "version": "0.1.0",
     "compiler": {
       "pond": 0,
-      "min-drop": 572
+      "min-drop": 575
     },
     "source": {
       "commit": "__COMMIT_SHA__",
