@@ -1,0 +1,16 @@
+// pdf: PDF files written from drawing commands, in Coi.
+//
+//   import "@coi/pdf";
+//
+//   mut Pdf::Writer pdf = Pdf::Writer(&written);     // written(uint8[] data, string error)
+//   pdf.begin();
+//   pdf.addFont("body", "/fonts/inter-400.ttf");      // TrueType, embedded with only the glyphs used
+//   pdf.addPage(595.0, 842.0);                        // points, origin top left, y down
+//   pdf.setFillColor(31, 41, 51, 1.0);
+//   pdf.setFont("body");
+//   pdf.drawText("Hello", 72.0, 100.0, 12.0);
+//   pdf.finish();
+
+module Pdf;
+
+pub import "src/Writer.coi";

@@ -1,0 +1,79 @@
+module Pdf;
+
+// Byte and number helpers for the writer and the font reader. Module-internal.
+
+// a number the short way, at most three decimals: 12, 12.5, -0.333
+def num(float x) : string {
+    int v = Math.round(x * 1000.0).toInt();
+    string sign = v < 0 ? "-" : "";
+    int a = v < 0 ? -v : v;
+    int whole = a / 1000;
+    mut int part = a % 1000;
+    if (part == 0) return `${sign}${whole}`;
+    mut string digits = part < 10 ? `00${part}` : (part < 100 ? `0${part}` : `${part}`);
+    while (digits.at(digits.length() - 1) == "0") digits = digits.subStr(0, digits.length() - 1);
+    return `${sign}${whole}.${digits}`;
+}
+
+// big-endian reads; past the end reads as 0
+def u8(uint8[] b, int at) : int { return at >= 0 && at < b.size() ? b[at].toInt() : 0; }
+def u16(uint8[] b, int at) : int { return (u8(b, at) << 8) | u8(b, at + 1); }
+def i16(uint8[] b, int at) : int {
+    int v = u16(b, at);
+    return v >= 32768 ? v - 65536 : v;
+}
+def u32(uint8[] b, int at) : int64 { return (u16(b, at).toInt64() << 16) | u16(b, at + 2).toInt64(); }
+def i32(uint8[] b, int at) : int { return (u16(b, at) << 16) | u16(b, at + 2); }
+
+def put16(mut uint8[]& b, int v) : void { b.push((v >> 8) & 255); b.push(v & 255); }
+def put32(mut uint8[]& b, int64 v) : void {
+    b.push(((v >> 24) & 255).toInt());
+    b.push(((v >> 16) & 255).toInt());
+    b.push(((v >> 8) & 255).toInt());
+    b.push((v & 255).toInt());
+}
+def set32(mut uint8[]& b, int at, int64 v) : void {
+    b[at] = ((v >> 24) & 255).toInt();
+    b[at + 1] = ((v >> 16) & 255).toInt();
+    b[at + 2] = ((v >> 8) & 255).toInt();
+    b[at + 3] = (v & 255).toInt();
+}
+
+// four hex digits
+def hex4(int v) : string {
+    string d = "0123456789abcdef";
+    return d.at((v >> 12) & 15) + d.at((v >> 8) & 15) + d.at((v >> 4) & 15) + d.at(v & 15);
+}
+
+// a string's text as UTF-16 code units in hex, for a ToUnicode map
+def utf16hex(string s) : string {
+    mut string out = "";
+    for c in chars(s) {
+        if (c.cp >= 0x10000) {
+            int v = c.cp - 0x10000;
+            out += hex4(0xd800 + (v >> 10)) + hex4(0xdc00 + (v & 1023));
+        } else {
+            out += hex4(c.cp);
+        }
+    }
+    return out;
+}
+
+// a string's code points and the UTF-8 of each, for text drawn in a TrueType font
+pod Char { int cp; string text; }
+def chars(string s) : Char[] {
+    mut Char[] out;
+    uint8[] b = s.toBytes();
+    mut int i = 0;
+    while (i < b.size()) {
+        int c = b[i].toInt();
+        mut int cp = c;
+        mut int n = 1;
+        if (c >= 0xf0) { cp = ((c & 7) << 18) | ((u8(b, i + 1) & 63) << 12) | ((u8(b, i + 2) & 63) << 6) | (u8(b, i + 3) & 63); n = 4; }
+        else if (c >= 0xe0) { cp = ((c & 15) << 12) | ((u8(b, i + 1) & 63) << 6) | (u8(b, i + 2) & 63); n = 3; }
+        else if (c >= 0xc0) { cp = ((c & 31) << 6) | (u8(b, i + 1) & 63); n = 2; }
+        out.push(Char{cp = cp, text = string.fromBytes(b.slice(i, n))});
+        i += n;
+    }
+    return out;
+}

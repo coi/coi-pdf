@@ -1,0 +1,212 @@
+module Pdf;
+import "Bytes.coi";
+
+// Reading a TrueType font (glyph outlines in `glyf`, as a .ttf has them) far enough to draw text
+// with it in a PDF: which glyph a character is, how wide it is, and the file again with every
+// glyph but the used ones emptied. Glyph ids stay as they were, so the PDF names glyphs by id.
+// Module-internal.
+
+pod Table { string tag; int off; int len; }
+pod Font {
+    bool ok;
+    uint8[] data;
+    Table[] tables;
+    int upem; int[] bbox; bool longLoca; int ascent; int descent; int capHeight; float italic;
+    int nMetrics; int nGlyphs;
+    int hmtx; int loca; int glyf; int cmap; int cmapFormat;     // offsets; cmap: the Unicode subtable
+}
+pod TableData { string tag; uint8[] data; }
+
+def tableAt(Font& f, string tag) : int {
+    int i = f.tables.indexOf(t => t.tag == tag);
+    return i < 0 ? -1 : f.tables[i].off;
+}
+
+def readFont(uint8[] b) : Font {
+    mut Font f;
+    f.ok = false;
+    f.data = b;
+    if (b.size() < 12) return f;
+    int n = u16(b, 4);
+    for i in 0:n {
+        int r = 12 + i * 16;
+        if (r + 16 > b.size()) return f;
+        string tag = string.fromBytes(b.slice(r, 4));
+        f.tables.push(Table{tag = tag, off = u32(b, r + 8).toInt(), len = u32(b, r + 12).toInt()});
+    }
+    for t in ["head", "hhea", "hmtx", "maxp", "loca", "glyf", "cmap"] {
+        if (tableAt(&f, t) < 0) return f;
+    }
+    int head = tableAt(&f, "head");
+    int hhea = tableAt(&f, "hhea");
+    f.upem = u16(b, head + 18);
+    f.bbox = [i16(b, head + 36), i16(b, head + 38), i16(b, head + 40), i16(b, head + 42)];
+    f.longLoca = i16(b, head + 50) == 1;
+    f.ascent = i16(b, hhea + 4);
+    f.descent = i16(b, hhea + 6);
+    f.nMetrics = u16(b, hhea + 34);
+    f.nGlyphs = u16(b, tableAt(&f, "maxp") + 4);
+    f.hmtx = tableAt(&f, "hmtx");
+    f.loca = tableAt(&f, "loca");
+    f.glyf = tableAt(&f, "glyf");
+    int os2 = tableAt(&f, "OS/2");
+    f.capHeight = os2 >= 0 && u16(b, os2) >= 2 ? i16(b, os2 + 88) : f.ascent;
+    int post = tableAt(&f, "post");
+    f.italic = post >= 0 ? i32(b, post + 4).toFloat() / 65536.0 : 0.0;
+    // the Unicode subtable: format 12 (every plane) before format 4 (the first one)
+    int cm = tableAt(&f, "cmap");
+    f.cmap = -1;
+    f.cmapFormat = 0;
+    for i in 0:u16(b, cm + 2) {
+        int pid = u16(b, cm + 4 + i * 8);
+        int eid = u16(b, cm + 6 + i * 8);
+        int off = cm + u32(b, cm + 8 + i * 8).toInt();
+        int format = u16(b, off);
+        bool unicode = (pid == 3 && (eid == 1 || eid == 10)) || pid == 0;
+        if (!unicode) continue;
+        if (format == 12 && f.cmapFormat != 12) { f.cmap = off; f.cmapFormat = 12; }
+        else if (format == 4 && f.cmapFormat == 0) { f.cmap = off; f.cmapFormat = 4; }
+    }
+    f.ok = f.cmap >= 0 && f.upem > 0;
+    return f;
+}
+
+// the glyph for a code point, 0 when the font has none
+def glyphOf(Font& f, int cp) : int {
+    uint8[] b = f.data;
+    int o = f.cmap;
+    if (o < 0) return 0;
+    if (f.cmapFormat == 12) {
+        int64 groups = u32(b, o + 12);
+        for i in 0:groups.toInt() {
+            int g = o + 16 + i * 12;
+            int64 start = u32(b, g);
+            int64 end = u32(b, g + 4);
+            if (cp >= start && cp <= end) return (u32(b, g + 8) + cp - start).toInt();
+        }
+        return 0;
+    }
+    if (cp > 0xffff) return 0;
+    int seg2 = u16(b, o + 6);
+    int ends = o + 14;
+    int starts = ends + seg2 + 2;
+    int deltas = starts + seg2;
+    int ranges = deltas + seg2;
+    mut int i = 0;
+    while (i < seg2) {
+        if (cp <= u16(b, ends + i)) {
+            int start = u16(b, starts + i);
+            if (cp < start) return 0;
+            int delta = i16(b, deltas + i);
+            int ro = u16(b, ranges + i);
+            if (ro == 0) return (cp + delta) & 0xffff;
+            int g = u16(b, ranges + i + ro + (cp - start) * 2);
+            return g == 0 ? 0 : (g + delta) & 0xffff;
+        }
+        i += 2;
+    }
+    return 0;
+}
+
+def advance(Font& f, int gid) : int {
+    int i = gid < f.nMetrics ? gid : f.nMetrics - 1;
+    return u16(f.data, f.hmtx + i * 4);
+}
+
+// where a glyph's outline is in glyf: [start, end)
+def glyphStart(Font& f, int gid) : int { return f.longLoca ? u32(f.data, f.loca + gid * 4).toInt() : u16(f.data, f.loca + gid * 2) * 2; }
+
+// the font with every glyph but these (and the parts their composites are built from) emptied
+def subset(Font& f, int[] used) : uint8[] {
+    uint8[] b = f.data;
+    mut bool[] keep = [false; 0];
+    for g in 0:f.nGlyphs { keep.push(false); }
+    keep[0] = true;
+    mut int[] todo;
+    for g in used { if (g > 0 && g < f.nGlyphs && !keep[g]) { keep[g] = true; todo.push(g); } }
+    while (!todo.isEmpty()) {
+        int g = todo[todo.size() - 1];
+        todo.pop();
+        int a = glyphStart(&f, g);
+        int e = glyphStart(&f, g + 1);
+        if (e - a < 10 || i16(b, f.glyf + a) >= 0) continue;
+        mut int p = f.glyf + a + 10;
+        mut bool more = true;
+        while (more) {
+            int flags = u16(b, p);
+            int part = u16(b, p + 2);
+            if (part < f.nGlyphs && !keep[part]) { keep[part] = true; todo.push(part); }
+            p += 4 + ((flags & 1) != 0 ? 4 : 2);
+            if ((flags & 8) != 0) p += 2;
+            else if ((flags & 0x40) != 0) p += 4;
+            else if ((flags & 0x80) != 0) p += 8;
+            more = (flags & 0x20) != 0;
+        }
+    }
+    mut uint8[] glyf;
+    mut uint8[] loca;
+    for g in 0:f.nGlyphs {
+        put32(&loca, glyf.size().toInt64());
+        if (!keep[g]) continue;
+        int a = glyphStart(&f, g);
+        int e = glyphStart(&f, g + 1);
+        if (e > a) glyf.append(b.slice(f.glyf + a, e - a));
+        while (glyf.size() % 4 != 0) glyf.push(0);
+    }
+    put32(&loca, glyf.size().toInt64());
+    // head: long loca offsets, the whole-file checksum not worked out again
+    int headAt = f.tables.indexOf(t => t.tag == "head");
+    mut uint8[] head = b.slice(f.tables[headAt].off, f.tables[headAt].len);
+    set32(&head, 8, 0);
+    head[50] = 0;
+    head[51] = 1;
+    mut TableData[] out = [TableData{tag = "glyf", data = glyf}, TableData{tag = "head", data = head}, TableData{tag = "loca", data = loca}];
+    for t in f.tables {
+        bool copied = t.tag == "hhea" || t.tag == "hmtx" || t.tag == "maxp" || t.tag == "cvt " || t.tag == "fpgm" ||
+                      t.tag == "prep" || t.tag == "cmap" || t.tag == "OS/2" || t.tag == "post" || t.tag == "name";
+        if (copied) out.push(TableData{tag = t.tag, data = b.slice(t.off, t.len)});
+    }
+    return sfnt(out);
+}
+
+// tables into a font file: the directory (sorted by tag), then each table on a 4-byte boundary
+def sfnt(TableData[] input) : uint8[] {
+    mut TableData[] tables = input;
+    // sort by tag: few tables, a plain insertion sort
+    for i in 1:tables.size() {
+        mut int j = i;
+        while (j > 0 && tables[j - 1].tag > tables[j].tag) {
+            TableData t = tables[j];
+            tables[j] = tables[j - 1];
+            tables[j - 1] = t;
+            j -= 1;
+        }
+    }
+    int n = tables.size();
+    mut int pow = 1;
+    mut int log = 0;
+    while (pow * 2 <= n) { pow *= 2; log += 1; }
+    mut uint8[] out;
+    put32(&out, 0x00010000);
+    put16(&out, n);
+    put16(&out, pow * 16);
+    put16(&out, log);
+    put16(&out, n * 16 - pow * 16);
+    mut int at = 12 + n * 16;
+    for t in tables {
+        mut int64 sum = 0;
+        mut int k = 0;
+        while (k < t.data.size()) { sum = (sum + u32(t.data, k)) & 0xffffffff; k += 4; }
+        uint8[] tag = t.tag.toBytes();
+        for c in tag { out.push(c); }
+        put32(&out, sum);
+        put32(&out, at.toInt64());
+        put32(&out, t.data.size().toInt64());
+        at += (t.data.size() + 3) / 4 * 4;
+    }
+    for t in tables {
+        out.append(t.data);
+        while (out.size() % 4 != 0) out.push(0);
+    }
+    return out;
+}

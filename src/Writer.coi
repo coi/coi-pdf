@@ -1,0 +1,426 @@
+module Pdf;
+import "Bytes.coi";
+import "TrueType.coi";
+
+// A PDF from drawing commands: pages of paths, pictures and text, in points with the origin at the
+// top left and y going down. Text is Helvetica (in every reader, Latin-1 only) unless a TrueType
+// font was added for it; those are fetched when the document is finished and embedded with only
+// the glyphs used, along with the text behind them, so it can be searched and copied.
+//
+//   mut Pdf::Writer pdf = Pdf::Writer(&written);     // written(uint8[] data, string error)
+//   pdf.begin();
+//   pdf.addFont("body", "/fonts/inter-400.ttf");
+//   pdf.addPage(595.0, 842.0);
+//   pdf.setFont("body");
+//   pdf.drawText("Hello", 72.0, 100.0, 12.0);
+//   pdf.finish();
+
+pub enum Cap { Butt, Round, Square }
+pub enum Join { Miter, Round, Bevel }
+
+pod TextOp { int at; string font; string text; float x; float y; float size; }
+pod FontName { string name; string[] urls; }
+pod FontFile { string url; Font font; int[] gids; string[] texts; string fontKey; }
+// one numbered object: its dictionary's entries, and a stream when it has one (deflated first
+// when `deflate`)
+pod Obj { string dict; bool stream; bool deflate; uint8[] data; }
+pod Picture { int w; int h; bool jpeg; uint8[] data; uint8[] alpha; }
+pod Run { int file; int[] gids; }
+
+pub component Writer(def onWritten(uint8[], string) : void) {
+    mut string[] ops;           // every page's content, one operator per entry
+    mut int[] pageStart;        // where each page's ops begin
+    mut float[] pageW;
+    mut float[] pageH;
+    mut float px = 0.0;         // the current point, for quadTo
+    mut float py = 0.0;
+    mut string[] alphas;        // the opacity settings used ("f0.5", "s1"), named /G<i>
+    mut Picture[] pictures;
+    mut DOMElement[] pictureSources;    // <img> elements already copied, to store each once
+    mut int[] pictureOf;
+    mut Canvas scratch;
+    mut bool scratchMade = false;
+    mut bool helvetica = false;
+    mut FontName[] fonts;
+    mut string fontName = "";
+    mut TextOp[] texts;
+    mut FontFile[] files;
+    mut string[] fetchQueue;
+    mut int fetching = 0;
+    mut Obj[] objs;
+    mut int deflating = 0;
+    mut bool working = false;
+
+    // a new document; everything drawn before is gone
+    pub def begin() : void {
+        ops = []; pageStart = []; pageW = []; pageH = [];
+        alphas = []; pictures = []; pictureSources = []; pictureOf = [];
+        helvetica = false; fonts = []; fontName = ""; texts = []; files = [];
+        fetchQueue = []; fetching = 0; objs = []; deflating = 0; working = false;
+    }
+
+    pub def addPage(float width, float height) : void {
+        pageStart.push(ops.size());
+        pageW.push(width);
+        pageH.push(height);
+        ops.push(`1 0 0 -1 0 ${num(height)} cm`);
+    }
+    def op(string s) : void { if (!pageStart.isEmpty()) ops.push(s); }
+
+    def alpha(string key) : string {
+        mut int i = alphas.indexOf(key);
+        if (i < 0) { alphas.push(key); i = alphas.size() - 1; }
+        return `/G${i} gs`;
+    }
+    def color(int r, int g, int b, float a, bool fill) : void {
+        op(`${num(r.toFloat() / 255.0)} ${num(g.toFloat() / 255.0)} ${num(b.toFloat() / 255.0)} ${fill ? "rg" : "RG"}`);
+        op(alpha(`${fill ? "f" : "s"}${num(Math.clamp(a, 0.0, 1.0))}`));
+    }
+    pub def setStrokeColor(int r, int g, int b, float a) : void { color(r, g, b, a, false); }
+    pub def setFillColor(int r, int g, int b, float a) : void { color(r, g, b, a, true); }
+    pub def setLineWidth(float width) : void { op(`${num(width)} w`); }
+    pub def setLineCap(Cap cap) : void { int c = cap; op(`${c} J`); }
+    pub def setLineJoin(Join join) : void { int j = join; op(`${j} j`); }
+
+    pub def moveTo(float x, float y) : void { op(`${num(x)} ${num(y)} m`); px = x; py = y; }
+    pub def lineTo(float x, float y) : void { op(`${num(x)} ${num(y)} l`); px = x; py = y; }
+    pub def curveTo(float c1x, float c1y, float c2x, float c2y, float x, float y) : void {
+        op(`${num(c1x)} ${num(c1y)} ${num(c2x)} ${num(c2y)} ${num(x)} ${num(y)} c`);
+        px = x;
+        py = y;
+    }
+    // a quadratic curve as a cubic one: the control points 2/3 of the way to the quadratic's
+    pub def quadTo(float cx, float cy, float x, float y) : void {
+        curveTo(px + 2.0 / 3.0 * (cx - px), py + 2.0 / 3.0 * (cy - py), x + 2.0 / 3.0 * (cx - x), y + 2.0 / 3.0 * (cy - y), x, y);
+    }
+    pub def rect(float x, float y, float w, float h) : void { op(`${num(x)} ${num(y)} ${num(w)} ${num(h)} re`); }
+    pub def closePath() : void { op("h"); }
+    pub def stroke() : void { op("S"); }
+    pub def fill() : void { op("f"); }
+    // the colors, width and the rest as they are now, and back
+    pub def save() : void { op("q"); }
+    pub def restore() : void { op("Q"); }
+
+    // ---- pictures ----------------------------------------------------------------------------
+
+    // an <img> or a <canvas>, its pixels copied now: opaque ones as JPEG, the rest with their
+    // transparency. The same <img> drawn again is stored once
+    pub def drawImage(DOMElement source, float x, float y, float w, float h) : void {
+        if (pageStart.isEmpty()) return;
+        string natural = source.getProperty("naturalWidth");
+        bool img = !natural.isEmpty() && natural != "undefined";
+        mut int k = img ? pictureSources.indexOf(source) : -1;
+        if (k >= 0) k = pictureOf[k];
+        else {
+            k = copyPicture(source, img);
+            if (k < 0) return;
+            if (img) { pictureSources.push(source); pictureOf.push(k); }
+        }
+        op(`q ${num(w)} 0 0 ${num(-h)} ${num(x)} ${num(y + h)} cm /Im${k} Do Q`);
+    }
+
+    def copyPicture(DOMElement source, bool img) : int {
+        int sw = source.getProperty(img ? "naturalWidth" : "width").toInt();
+        int sh = source.getProperty(img ? "naturalHeight" : "height").toInt();
+        if (sw <= 0 || sh <= 0) return -1;
+        if (!scratchMade) { scratch = Canvas.createCanvas("coi-pdf-picture", 1.0, 1.0); scratchMade = true; }
+        scratch.setSize(sw.toFloat(), sh.toFloat());
+        mut CanvasContext2D c = scratch.getContext2d();
+        c.clearRect(0.0, 0.0, sw.toFloat(), sh.toFloat());
+        c.drawImage(source, 0.0, 0.0);
+        uint8[] px = c.getImageData(0, 0, sw, sh);
+        mut bool opaque = true;
+        mut int i = 3;
+        while (i < px.size()) {
+            if (px[i] != 255) { opaque = false; break; }
+            i += 4;
+        }
+        if (opaque) {
+            pictures.push(Picture{w = sw, h = sh, jpeg = true, data = scratch.toBytes("image/jpeg", 0.92), alpha = []});
+        } else {
+            mut uint8[] rgb;
+            mut uint8[] a;
+            rgb.reserve(sw * sh * 3);
+            a.reserve(sw * sh);
+            mut int p = 0;
+            while (p + 3 < px.size()) {
+                rgb.push(px[p]); rgb.push(px[p + 1]); rgb.push(px[p + 2]);
+                a.push(px[p + 3]);
+                p += 4;
+            }
+            pictures.push(Picture{w = sw, h = sh, jpeg = false, data = rgb, alpha = a});
+        }
+        return pictures.size() - 1;
+    }
+
+    // ---- text --------------------------------------------------------------------------------
+
+    // a TrueType file (.ttf) under a name for setFont; more files under one name make a chain,
+    // each character drawn from the first that has it (a Latin file, then an extended one)
+    pub def addFont(string name, string url) : void {
+        if (name.isEmpty() || url.isEmpty()) return;
+        int i = fonts.indexOf(f => f.name == name);
+        if (i < 0) fonts.push(FontName{name = name, urls = [url]});
+        else {
+            mut FontName f = fonts[i];
+            f.urls.push(url);
+            fonts[i] = f;
+        }
+    }
+    // the font drawText uses from here on, by its addFont name; "" (or one never added) is Helvetica
+    pub def setFont(string name) : void { fontName = fonts.any(f => f.name == name) ? name : ""; }
+
+    // y is the baseline
+    pub def drawText(string text, float x, float y, float size) : void {
+        if (pageStart.isEmpty()) return;
+        if (fontName.isEmpty()) { op(helv(text, x, y, size)); return; }
+        texts.push(TextOp{at = ops.size(), font = fontName, text = text, x = x, y = y, size = size});
+        op("");
+    }
+
+    // Helvetica, WinAnsi: Latin-1 only, the rest becomes '?'; bytes past ASCII as octal escapes
+    def helv(string text, float x, float y, float size) : string {
+        helvetica = true;
+        mut string s = "";
+        for c in chars(text) {
+            int b = c.cp >= 32 && c.cp < 256 ? c.cp : 63;
+            if (b == 92 || b == 40 || b == 41) s += "\\" + c.text;
+            else if (b < 128) s += b == 63 && c.cp != 63 ? "?" : c.text;
+            else s += "\\${(b >> 6) & 7}${(b >> 3) & 7}${b & 7}";
+        }
+        return `BT /Helv ${num(size)} Tf 1 0 0 -1 ${num(x)} ${num(y)} Tm (${s}) Tj ET`;
+    }
+
+    // ---- finishing: the fonts fetched, every stream deflated, the file put together ----------
+
+    pub def finish() : void {
+        if (working) return;
+        working = true;
+        fetchQueue = [];
+        for t in texts {
+            int i = fonts.indexOf(f => f.name == t.font);
+            if (i < 0) continue;
+            for u in fonts[i].urls { if (!fetchQueue.contains(u)) fetchQueue.push(u); }
+        }
+        fetching = 0;
+        nextFont();
+    }
+
+    def nextFont() : void {
+        if (fetching >= fetchQueue.size()) { build(); return; }
+        FetchRequest.request("GET", fetchQueue[fetching], "", [], &onError = fontFailed, &onDone = fontFetched);
+    }
+    def fontFetched(int status, Blob body) : void {
+        uint8[] bytes = body.take();
+        if (status == 200) {
+            Font f = readFont(bytes);
+            if (f.ok) files.push(FontFile{url = fetchQueue[fetching], font = f, gids = [], texts = [], fontKey = `F${files.size()}`});
+            else System.warn(`pdf: ${fetchQueue[fetching]} is not a TrueType font`);
+        } else {
+            System.warn(`pdf: font not loaded, ${status} for ${fetchQueue[fetching]}`);
+        }
+        fetching += 1;
+        nextFont();
+    }
+    def fontFailed(string error) : void {
+        System.warn(`pdf: font not loaded, ${error}`);
+        fetching += 1;
+        nextFont();
+    }
+
+    // a glyph noted as used in a file, with the text it stands for (the first one wins)
+    def use(int file, int gid, string text) : void {
+        mut FontFile f = files[file];
+        if (!f.gids.contains(gid)) { f.gids.push(gid); f.texts.push(text); }
+        files[file] = f;
+    }
+
+    // a text op in an added font: runs of glyphs per file; Helvetica when none of its files came
+    def textOp(TextOp t) : string {
+        int fi = fonts.indexOf(f => f.name == t.font);
+        mut int[] chain;
+        for u in fonts[fi].urls {
+            int k = files.indexOf(f => f.url == u);
+            if (k >= 0) chain.push(k);
+        }
+        if (chain.isEmpty()) return helv(t.text, t.x, t.y, t.size);
+        mut Run[] runs;
+        for c in chars(t.text) {
+            mut int file = chain[0];
+            mut int gid = 0;
+            for k in chain {
+                int g = glyphOf(&files[k].font, c.cp);
+                if (g != 0) { file = k; gid = g; break; }
+            }
+            if (gid == 0) {
+                // in no file: a '?', which copies as one too
+                gid = glyphOf(&files[file].font, 63);
+                use(file, gid, "?");
+            } else {
+                use(file, gid, c.text);
+            }
+            if (!runs.isEmpty() && runs[runs.size() - 1].file == file) {
+                mut Run r = runs[runs.size() - 1];
+                r.gids.push(gid);
+                runs[runs.size() - 1] = r;
+            } else {
+                runs.push(Run{file = file, gids = [gid]});
+            }
+        }
+        mut string s = `BT 1 0 0 -1 ${num(t.x)} ${num(t.y)} Tm`;
+        for r in runs {
+            mut string hex = "";
+            for g in r.gids { hex += hex4(g); }
+            s += ` /${files[r.file].fontKey} ${num(t.size)} Tf <${hex}> Tj`;
+        }
+        return s + " ET";
+    }
+
+    def add(string dict) : int { objs.push(Obj{dict = dict, stream = false, deflate = false, data = []}); return objs.size(); }
+    def addStream(string dict, uint8[] data, bool deflate) : int {
+        objs.push(Obj{dict = dict, stream = true, deflate = deflate, data = data});
+        return objs.size();
+    }
+    def ref(int n) : string { return `${n} 0 R`; }
+
+    // one file as a Type0 font: the cut-down file, the glyphs' widths, and the map back to text
+    def embedFont(int fi) : int {
+        FontFile file = files[fi];
+        Font f = file.font;
+        float k = 1000.0 / f.upem.toFloat();
+        string tag = `${"ABCDEFGHIJKLMNOP".at(fi / 16 % 16)}${"ABCDEFGHIJKLMNOP".at(fi % 16)}AAAA`;
+        mut string base = "";
+        for c in chars(file.url.subStr(file.url.indexOf("/", 0) < 0 ? 0 : lastSlash(file.url) + 1)) {
+            bool keep = (c.cp >= 48 && c.cp <= 57) || (c.cp >= 65 && c.cp <= 90) || (c.cp >= 97 && c.cp <= 122) || c.cp == 45;
+            if (c.text == ".") break;
+            if (keep) base += c.text;
+        }
+        string name = `/${tag}+${base.isEmpty() ? "Font" : base}`;
+        uint8[] bytes = subset(&f, file.gids);
+        int fontFile = addStream(`/Length1 ${bytes.size()} /Filter /FlateDecode`, bytes, true);
+        string bbox = `${num(f.bbox[0].toFloat() * k)} ${num(f.bbox[1].toFloat() * k)} ${num(f.bbox[2].toFloat() * k)} ${num(f.bbox[3].toFloat() * k)}`;
+        int desc = add(`/Type /FontDescriptor /FontName ${name} /Flags 4 /FontBBox [${bbox}] /ItalicAngle ${num(f.italic)} /Ascent ${num(f.ascent.toFloat() * k)} /Descent ${num(f.descent.toFloat() * k)} /CapHeight ${num(f.capHeight.toFloat() * k)} /StemV 80 /FontFile2 ${ref(fontFile)}`);
+        mut int[] order = file.gids;
+        order.sort();
+        mut string widths = "";
+        for g in order { widths += `${g} [${num(advance(&f, g).toFloat() * k)}] `; }
+        int cid = add(`/Type /Font /Subtype /CIDFontType2 /BaseFont ${name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor ${ref(desc)} /W [${widths.trim()}] /CIDToGIDMap /Identity`);
+        mut string map = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n";
+        mut int i = 0;
+        while (i < order.size()) {
+            int n = order.size() - i < 100 ? order.size() - i : 100;
+            map += "${n} beginbfchar\n";
+            for j in i:(i + n) {
+                int g = order[j];
+                map += "<${hex4(g)}> <${utf16hex(file.texts[file.gids.indexOf(g)])}>\n";
+            }
+            map += "endbfchar\n";
+            i += n;
+        }
+        map += "endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n";
+        int toUnicode = addStream("/Filter /FlateDecode", map.toBytes(), true);
+        return add(`/Type /Font /Subtype /Type0 /BaseFont ${name} /Encoding /Identity-H /DescendantFonts [${ref(cid)}] /ToUnicode ${ref(toUnicode)}`);
+    }
+    def lastSlash(string s) : int {
+        mut int at = -1;
+        mut int from = s.indexOf("/", 0);
+        while (from >= 0) { at = from; from = s.indexOf("/", from + 1); }
+        return at;
+    }
+
+    def build() : void {
+        // text in added fonts, now that their files are in
+        for t in texts { ops[t.at] = textOp(t); }
+        objs = [];
+        add("/Type /Catalog /Pages 2 0 R");
+        add("");    // the page tree, filled in below
+        mut string fontRes = "";
+        for fi in 0:files.size() {
+            if (!files[fi].gids.isEmpty()) fontRes += ` /${files[fi].fontKey} ${ref(embedFont(fi))}`;
+        }
+        if (helvetica) fontRes += ` /Helv ${ref(add("/Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding"))}`;
+        mut string res = fontRes.isEmpty() ? "" : `/Font <<${fontRes} >>`;
+        if (!alphas.isEmpty()) {
+            mut string gs = " /ExtGState <<";
+            for i in 0:alphas.size() {
+                string a = alphas[i];
+                gs += ` /G${i} ${ref(add(`/Type /ExtGState /${a.at(0) == "f" ? "ca" : "CA"} ${a.subStr(1)}`))}`;
+            }
+            res += gs + " >>";
+        }
+        if (!pictures.isEmpty()) {
+            mut string xo = " /XObject <<";
+            for i in 0:pictures.size() {
+                Picture p = pictures[i];
+                string dims = `/Width ${p.w} /Height ${p.h} /BitsPerComponent 8`;
+                mut int n = 0;
+                if (p.jpeg) {
+                    n = addStream(`/Type /XObject /Subtype /Image ${dims} /ColorSpace /DeviceRGB /Filter /DCTDecode`, p.data, false);
+                } else {
+                    int mask = addStream(`/Type /XObject /Subtype /Image ${dims} /ColorSpace /DeviceGray /Filter /FlateDecode`, p.alpha, true);
+                    n = addStream(`/Type /XObject /Subtype /Image ${dims} /ColorSpace /DeviceRGB /Filter /FlateDecode /SMask ${ref(mask)}`, p.data, true);
+                }
+                xo += ` /Im${i} ${ref(n)}`;
+            }
+            res += xo + " >>";
+        }
+        string resources = `<< ${res.trim()} >>`;
+        mut string kids = "";
+        for p in 0:pageStart.size() {
+            int end = p + 1 < pageStart.size() ? pageStart[p + 1] : ops.size();
+            mut string content = "";
+            for i in pageStart[p]:end { content += ops[i] + "\n"; }
+            int c = addStream("/Filter /FlateDecode", content.toBytes(), true);
+            kids += ` ${ref(add(`/Type /Page /Parent 2 0 R /MediaBox [0 0 ${num(pageW[p])} ${num(pageH[p])}] /Resources ${resources} /Contents ${ref(c)}`))}`;
+        }
+        mut Obj tree = objs[1];
+        tree.dict = `/Type /Pages /Kids [${kids.trim()}] /Count ${pageStart.size()}`;
+        objs[1] = tree;
+        deflating = 0;
+        nextDeflate();
+    }
+
+    def nextDeflate() : void {
+        while (deflating < objs.size() && !objs[deflating].deflate) deflating += 1;
+        if (deflating >= objs.size()) { assemble(); return; }
+        Compression.compress(objs[deflating].data, "deflate", &onDone = deflated);
+    }
+    def deflated(Blob data, string error) : void {
+        if (!error.isEmpty()) { working = false; onWritten([], `deflate failed: ${error}`); return; }
+        mut Obj o = objs[deflating];
+        o.data = data.take();
+        o.deflate = false;
+        objs[deflating] = o;
+        deflating += 1;
+        nextDeflate();
+    }
+
+    def assemble() : void {
+        mut uint8[] out = "%PDF-1.4\n%".toBytes();
+        out.append([0xe2, 0xe3, 0xcf, 0xd3, 10]);
+        mut int[] offsets;
+        for i in 0:objs.size() {
+            Obj o = objs[i];
+            offsets.push(out.size());
+            if (o.stream) {
+                out.append("${i + 1} 0 obj\n<< ${o.dict} /Length ${o.data.size()} >>\nstream\n".toBytes());
+                out.append(o.data);
+                out.append("\nendstream\nendobj\n".toBytes());
+            } else {
+                out.append("${i + 1} 0 obj\n<< ${o.dict} >>\nendobj\n".toBytes());
+            }
+        }
+        mut string xref = "xref\n0 ${objs.size() + 1}\n0000000000 65535 f \n";
+        for o in offsets {
+            string d = `${o}`;
+            mut string pad = "";
+            for i in d.length():10 { pad += "0"; }
+            xref += "${pad}${d} 00000 n \n";
+        }
+        xref += "trailer\n<< /Size ${objs.size() + 1} /Root 1 0 R >>\nstartxref\n${out.size()}\n%%EOF\n";
+        out.append(xref.toBytes());
+        working = false;
+        objs = [];
+        onWritten(out, "");
+    }
+}
