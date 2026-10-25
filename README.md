@@ -109,9 +109,12 @@ freed afterwards. Opaque pictures are stored as JPEG, the rest keep their transp
 
 - `addFont(name, url)`
 - `setFont(name)`
+- `setTextSlant(slant)`
 - `drawText(text, x, y, size)`
 
-`y` is the baseline. Without a font the text is Helvetica, which every PDF reader has but which
+`y` is the baseline. `setTextSlant` leans the text drawn after it to the right: each point of a
+letter moves over by `slant` times its height above the baseline. `0.25` is the slant browsers give a font that has no
+italic face, so text set in italic on a web page comes out the same in the PDF; `0` is upright again. Without a font the text is Helvetica, which every PDF reader has but which
 covers Latin-1 only (other characters become `?`).
 
 `addFont` takes a TrueType file (`.ttf`). Several files under one name make a chain: each

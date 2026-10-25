@@ -18,7 +18,7 @@ import "TrueType.coi";
 pub enum Cap { Butt, Round, Square }
 pub enum Join { Miter, Round, Bevel }
 
-pod TextOp { int at; string font; string text; float x; float y; float size; }
+pod TextOp { int at; string font; string text; float x; float y; float size; float slant; }
 pod FontName { string name; string[] urls; }
 pod FontFile { string url; Font font; int[] gids; string[] texts; string fontKey; }
 // one numbered object: its dictionary's entries, and a stream when it has one (deflated first
@@ -43,6 +43,7 @@ pub component Writer(def onWritten(uint8[], string) : void) {
     mut bool helvetica = false;
     mut FontName[] fonts;
     mut string fontName = "";
+    mut float slant = 0.0;
     mut TextOp[] texts;
     mut FontFile[] files;
     mut string[] fetchQueue;
@@ -55,7 +56,7 @@ pub component Writer(def onWritten(uint8[], string) : void) {
     pub def begin() : void {
         ops = []; pageStart = []; pageW = []; pageH = [];
         alphas = []; pictures = []; pictureSources = []; pictureOf = [];
-        helvetica = false; fonts = []; fontName = ""; texts = []; files = [];
+        helvetica = false; fonts = []; fontName = ""; slant = 0.0; texts = []; files = [];
         fetchQueue = []; fetching = 0; objs = []; deflating = 0; working = false;
     }
 
@@ -169,12 +170,16 @@ pub component Writer(def onWritten(uint8[], string) : void) {
     }
     // the font drawText uses from here on, by its addFont name; "" (or one never added) is Helvetica
     pub def setFont(string name) : void { fontName = fonts.any(f => f.name == name) ? name : ""; }
+    // text drawn from here on leans right: each point of a letter moves over by s times its
+    // height above the baseline. 0 is upright; 0.25 is the slant a browser gives a font that has
+    // no italic face
+    pub def setTextSlant(float s) : void { slant = s; }
 
     // y is the baseline
     pub def drawText(string text, float x, float y, float size) : void {
         if (pageStart.isEmpty()) return;
         if (fontName.isEmpty()) { op(helv(text, x, y, size)); return; }
-        texts.push(TextOp{at = ops.size(), font = fontName, text = text, x = x, y = y, size = size});
+        texts.push(TextOp{at = ops.size(), font = fontName, text = text, x = x, y = y, size = size, slant = slant});
         op("");
     }
 
@@ -188,8 +193,11 @@ pub component Writer(def onWritten(uint8[], string) : void) {
             else if (b < 128) s += b == 63 && c.cp != 63 ? "?" : c.text;
             else s += "\\${(b >> 6) & 7}${(b >> 3) & 7}${b & 7}";
         }
-        return `BT /Helv ${num(size)} Tf 1 0 0 -1 ${num(x)} ${num(y)} Tm (${s}) Tj ET`;
+        return `BT /Helv ${num(size)} Tf ${matrix(slant, x, y)} Tm (${s}) Tj ET`;
     }
+
+    // the text matrix: flipped back upright on the y-down page, the slant as a skew
+    def matrix(float lean, float x, float y) : string { return `1 0 ${num(lean)} -1 ${num(x)} ${num(y)}`; }
 
     // ---- finishing: the fonts fetched, every stream deflated, the file put together ----------
 
@@ -267,7 +275,7 @@ pub component Writer(def onWritten(uint8[], string) : void) {
                 runs.push(Run{file = file, gids = [gid]});
             }
         }
-        mut string s = `BT 1 0 0 -1 ${num(t.x)} ${num(t.y)} Tm`;
+        mut string s = `BT ${matrix(t.slant, t.x, t.y)} Tm`;
         for r in runs {
             mut string hex = "";
             for g in r.gids { hex += hex4(g); }

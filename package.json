@@ -6,6 +6,17 @@
   "description": "Write PDF files from drawing commands: paths, pictures, and text in embedded TrueType fonts.",
   "keywords": ["pdf", "export", "fonts", "truetype"],
   "releases": [{
+    "version": "0.2.0",
+    "compiler": {
+      "pond": 0,
+      "min-drop": 579
+    },
+    "source": {
+      "commit": "__COMMIT_SHA__",
+      "sha256": "__TARBALL_SHA256__"
+    },
+    "releasedAt": "2026-10-25"
+  }, {
     "version": "0.1.0",
     "compiler": {
       "pond": 0,
