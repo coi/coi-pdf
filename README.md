@@ -94,6 +94,7 @@ mut Pdf::Writer pdf = Pdf::Writer(&written);   // written(uint8[] data, string e
 - `setLineJoin(Pdf::Join::Round)` (`Miter`, `Round`, `Bevel`)
 - `save()`
 - `restore()`
+- `turn(angle, cx, cy)`: what's drawn next turned about (cx, cy), radians, clockwise like a canvas
 
 Colors are 0–255, alpha 0–1.
 

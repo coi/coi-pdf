@@ -101,6 +101,14 @@ pub component Writer(def onWritten(uint8[], string) : void) {
     // the colors, width and the rest as they are now, and back
     pub def save() : void { op("q"); }
     pub def restore() : void { op("Q"); }
+    // what's drawn from here on (paths, text, pictures) turned by angle about (cx, cy), in
+    // radians and clockwise on the page like a canvas's rotate; a save() before it and the
+    // restore() after it keep the turn to what's between
+    pub def turn(float angle, float cx, float cy) : void {
+        float c = Math.cos(angle);
+        float s = Math.sin(angle);
+        op(`${num(c)} ${num(s)} ${num(-s)} ${num(c)} ${num(cx - c * cx + s * cy)} ${num(cy - s * cx - c * cy)} cm`);
+    }
 
     // ---- pictures ----------------------------------------------------------------------------
 
